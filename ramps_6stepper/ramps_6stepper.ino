@@ -1,19 +1,3 @@
-/*
- * Copyright 2025 Noman Robotics
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include <AccelStepper.h>
 #include <MultiStepper.h>
 
@@ -84,6 +68,21 @@ int motorAccelerations[numJoints] = {1000, 1000, 1000, 1000, 1000, 1000}; // 每
 
 const float MIN_STEP = 1.5f;  // 最小步进角度
 
+// Command queue for buffering multiple EXEC commands
+#define CMD_QUEUE_SIZE 45
+struct CommandBuffer {
+    float angles[numJoints];
+    bool valid;
+};
+CommandBuffer commandQueue[CMD_QUEUE_SIZE];
+int queueHead = 0;  // where to read from
+int queueTail = 0;  // where to write to
+int queueCount = 0; // number of commands in queue
+
+// speed factors for each motor
+float jointSpeedFactors[numJoints] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+const unsigned long BASE_MOTION_DURATION = 900;
+
 // 创建6个AccelStepper对象
 AccelStepper stepper1(AccelStepper::DRIVER, J5_PUL_PIN, J5_DIR_PIN);
 AccelStepper stepper2(AccelStepper::DRIVER, J4_PUL_PIN, J4_DIR_PIN);
@@ -132,12 +131,12 @@ EOAT_Type currentEOAT;
 
 // 运行状态标志
 bool isExecute = false;
-bool isMovingOnce = false;
-bool isRecordingOnce = false;
-bool isDelayed = false;
+bool isRecordingOnceJoints = false;
+bool isRecordingOnceTool = false;
 bool isRecording = false;
 bool isReplaying = false;
 bool isPaused = false;
+bool isMoveTool = false;
 bool potentiometersEnabled = false; // 步进电机版本不使用电位器
 
 // 当前和目标角度
@@ -150,6 +149,9 @@ float homePositions[numJoints] = {0, -49, 69, 0, 0, 0}; // 机械臂初始位置
 int time_delay = 0;
 int time_elapse = 0;
 
+// M280 command tracking
+int targetToolState = 0;
+
 // 运动状态
 struct MotionState {
     float startPos;         // 起始角度
@@ -161,6 +163,14 @@ struct MotionState {
     bool isMoving;          // 是否在运动
 };
 MotionState jointStates[numJoints];
+
+// global motion management
+struct GlobalMotionState {
+    bool isNewMotion;           // whether it is a new motion command
+    unsigned long globalDuration;   // global unified motion time
+    int activeJoints;          // number of active joints
+    bool syncMode;             // sync mode (true=sync, false=independent)
+} globalMotion;
 
 int mode = 0; // 0表示控制器模式，1表示ROS模式
 
@@ -204,26 +214,72 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-// 计算运动持续时间
-unsigned long calculateMotionDuration(float angleChange, int jointId) {
-    float absChange = abs(angleChange);
-    // 根据电机配置和角度变化计算合理的运动时间
-    unsigned long baseDuration = 1000;  // 基础时间1秒
+// Queue helper functions
+bool isQueueFull() {
+    return queueCount >= CMD_QUEUE_SIZE;
+}
+
+bool isQueueEmpty() {
+    return queueCount == 0;
+}
+
+bool enqueueCommand(float angles[]) {
+    if (isQueueFull()) {
+        return false;
+    }
     
-    // 根据电机速度调整时间
-    if (jointId >= 0 && jointId < numJoints) {
-        // 角度变化越大，时间越长
-        baseDuration += (unsigned long)((absChange / 90.0f) * 2000);
-        
-        // 考虑电机速度（速度越高，时间越短）
-        float speedRatio = (float)motorMaxSpeeds[jointId] / BASE_MAX_SPEED;
-        
-        if (speedRatio > 0) {
-            return baseDuration / speedRatio;
+    // copy angles to queue
+    for (int i = 0; i < numJoints; i++) {
+        commandQueue[queueTail].angles[i] = angles[i];
+    }
+    commandQueue[queueTail].valid = true;
+    
+    // move tail pointer
+    queueTail = (queueTail + 1) % CMD_QUEUE_SIZE;
+    queueCount++;
+    
+    return true;
+}
+
+bool dequeueCommand(float angles[]) {
+    if (isQueueEmpty()) {
+        return false;
+    }
+    
+    // copy angles from queue
+    for (int i = 0; i < numJoints; i++) {
+        angles[i] = commandQueue[queueHead].angles[i];
+    }
+    commandQueue[queueHead].valid = false;
+    
+    // move head pointer
+    queueHead = (queueHead + 1) % CMD_QUEUE_SIZE;
+    queueCount--;
+    
+    return true;
+}
+
+// calculate the maximum motion time of all active joints
+unsigned long calculateGlobalMotionDuration(float targetAngles[], float currentAngles[]) {
+    unsigned long maxDuration = 0;
+    int activeCount = 0;
+    
+    for (int i = 0; i < numJoints; i++) {
+        float angleChange = abs(targetAngles[i] - currentAngles[i]);
+        if (angleChange >= MIN_STEP) {
+            activeCount++;
+            unsigned long duration = (unsigned long)(BASE_MOTION_DURATION * (angleChange / 90.0f));
+            duration = (unsigned long)(duration / jointSpeedFactors[i]);
+            if (duration > maxDuration) {
+                maxDuration = duration;
+            }
         }
     }
     
-    return baseDuration;
+    globalMotion.activeJoints = activeCount;
+    globalMotion.syncMode = (activeCount > 1); // multi-joint sync, single-joint independent
+    
+    return maxDuration;
 }
 
 // 设置校准偏移
@@ -234,7 +290,7 @@ void setCalibrationOffset(int joint, float offset) {
 }
 
 // 控制夹爪
-void controlGripper(float angle) {
+int controlGripper(float angle) {
     float clampedAngle = constrain(angle, 90.0f, 180.0f);
     // 将夹爪角度映射到PWM脉冲宽度
     int pulseWidth = map(clampedAngle, 90, 180, 1000, 2000);
@@ -242,17 +298,16 @@ void controlGripper(float angle) {
     // 如果有专用引脚控制夹爪舵机，可以在这里使用
     // 例如: servoPWM.setPWM(GRIPPER_PIN, 0, pulseWidth);
     
-    // 更新当前工具状态
-    currentEOAT.state = (angle > 135) ? true : false;
+    return (int)clampedAngle;
 }
 
 // 控制真空泵
-void controlPump(int state) {
+int controlPump(int state) {
     // 真空泵控制可能是直接通过数字引脚
     uint8_t suctionPin = currentEOAT.pins[0];
     
     if (currentEOAT.state == state) {
-        return;
+        return state;
     }
 
     if (state == 1) {
@@ -263,7 +318,7 @@ void controlPump(int state) {
         digitalWrite(suctionPin, LOW);
     }
     
-    currentEOAT.state = state;
+    return state;
 }
 
 // 启用或禁用单个步进电机
@@ -301,21 +356,10 @@ void updateStepperActivity(int index) {
 // 移动电机到目标角度
 float moveMotor(float targetDegree, float curDegree, int id, bool fake) {
     if(id >= 0 && id < numJoints) {
-        // 检查是否是工具移动
-        if(id == 4) { // 工具ID为4
-            if(abs(targetDegree - curDegree) >= MIN_STEP) {
-                jointStates[id].isMoving = true;
-                if(!fake) {
-                    if(currentEOAT.type == 0) { // 夹爪
-                        controlGripper(int(targetDegree));
-                    } else if(currentEOAT.type == 2) { // 真空泵
-                        controlPump(int(targetDegree));
-                    }
-                }
-            } else {
-                jointStates[id].isMoving = false;
-            }
-            return targetDegree;
+        // 工具关节(id=4)由单独的控制函数处理，这里不处理
+        if(id == 4 || id == 5) { 
+            // 工具和扩展轴暂不在此函数处理
+            return curDegree;
         }
         
         if(abs(targetDegree - curDegree) < MIN_STEP) {
@@ -332,7 +376,15 @@ float moveMotor(float targetDegree, float curDegree, int id, bool fake) {
             jointStates[id].targetSteps = degreesToSteps(targetDegree, id);
             
             jointStates[id].startTime = millis();
-            jointStates[id].duration = calculateMotionDuration(targetDegree - jointStates[id].startPos, id);
+            
+            // use global unified time or independent time
+            if (globalMotion.syncMode && globalMotion.globalDuration > 0) {
+                jointStates[id].duration = globalMotion.globalDuration;
+            } else {
+                float angleChange = abs(targetDegree - curDegree);
+                jointStates[id].duration = (unsigned long)(BASE_MOTION_DURATION * (angleChange / 90.0f) / jointSpeedFactors[id]);
+            }
+            
             jointStates[id].isMoving = true;
             
             // 设置新的目标位置
@@ -445,6 +497,7 @@ void setup() {
     currentEOAT.type = 0;           // 默认为夹爪
     currentEOAT.pins[0] = GRIPPER_PIN; // 默认使用夹爪引脚
     currentEOAT.pin_count = 1;
+    targetToolState = 90;
     currentEOAT.state = 90;
     
     // 初始化关节状态
@@ -466,6 +519,20 @@ void setup() {
     
     // 设置初始模式
     mode = 0;
+    
+    // initialize global motion state
+    globalMotion.isNewMotion = false;
+    globalMotion.globalDuration = 0;
+    globalMotion.activeJoints = 0;
+    globalMotion.syncMode = true;
+
+    // initialize command queue
+    queueHead = 0;
+    queueTail = 0;
+    queueCount = 0;
+    for (int i = 0; i < CMD_QUEUE_SIZE; i++) {
+        commandQueue[i].valid = false;
+    }
 }
 
 void loop() {
@@ -477,9 +544,11 @@ void loop() {
             // 返回固件版本和系统信息
             Serial.println("INFOS");
             Serial.println("VER," + String(FIRMWARE_VERSION));
+            Serial.println("Controller: RAMPS 1.4 + TB6600");
+            Serial.println("Motors: 6-axis Stepper");
             Serial.println("INFOE");
         } else if (command.startsWith("CALIBRATE,")) {
-            // 校准格式: CALIBRATE,关节,偏移量
+            // 校准格式: CALIBRATE,关节,偏移量 (保留单一偏移量的兼容性)
             int firstComma = command.indexOf(',');
             int secondComma = command.indexOf(',', firstComma + 1);
             
@@ -487,19 +556,51 @@ void loop() {
             float offset = command.substring(secondComma + 1).toFloat();
             
             setCalibrationOffset(joint, offset);
-            Serial.println("Calibration offset set");
+        } else if (command.startsWith("DELAY,")) {
+            String param = command.substring(6);
+            if (param.startsWith("S")) { 
+                float seconds = param.substring(1).toFloat();
+                time_delay = int(seconds * 1000);
+            } else if (param.startsWith("MS")) {
+                time_delay = param.substring(2).toInt();
+            }
+            delay(time_delay);
         } else if (command == "RECSTART") {
             isRecording = true;
             isReplaying = false;
         } else if (command == "RECSTOP") {
             isRecording = false;
-            isMovingOnce = false;
-            isRecordingOnce = false;
+            isRecordingOnceJoints = false;
+            isRecordingOnceTool = false;
+            
+            // reset targetAngles to current angles to prevent accidental movement
+            for (int i = 0; i < numJoints; i++) {
+                currentAngles[i] = targetAngles[i];
+            }
+        } else if (command.startsWith("REP,")) {
+            int startIndex = command.indexOf(',') + 1;
+            for (int i = 0; i < numJoints; i++) {
+                int nextIndex = command.indexOf(',', startIndex);
+                if (nextIndex == -1 && i < numJoints - 1) {
+                    return; // incorrect data format
+                }
+                String angleStr = (nextIndex == -1) ? command.substring(startIndex) : command.substring(startIndex, nextIndex);
+                targetAngles[i] = angleStr.toFloat();
+                startIndex = nextIndex + 1;
+            }
+            
+            // 立即设置位置（回放模式）
+            for (int i = 0; i < numSteppers; i++) {
+                long steps = degreesToSteps(targetAngles[i], i);
+                stepperArray[i]->moveTo(steps);
+                updateStepperActivity(i);
+            }
+            Serial.println("CP1");
         } else if (command == "REPSTART") {
             isReplaying = true;
             isRecording = false;
-            isRecordingOnce = false;
-            isMovingOnce = false;
+            isRecordingOnceJoints = false;
+            isRecordingOnceTool = false;
             isPaused = false;
         } else if (command == "REPPAUSE") {
             if (isReplaying) {
@@ -527,13 +628,12 @@ void loop() {
             mode = 1;
         } else if (command == "TOCTR") {
             mode = 0;
-        } else if (command.startsWith("TOOL[GRIPPER],")) {
+        } else if (command.startsWith("TOOL[GRIPPER]")) {
             currentEOAT.type = 0;
             currentEOAT.pin_count = 1;
             currentEOAT.state = 90;
-            
-            // 解析逗号分隔的IO指令
-            int startIndex = command.indexOf(',') + 1;
+
+            int startIndex = command.indexOf(',') + 1;  // skip TOOL[GRIPPER],
             String io_str = command.substring(startIndex);
             if(io_str.startsWith("IO")) {
                 int pin = io_str.substring(2).toInt();
@@ -542,19 +642,18 @@ void loop() {
             }
             
             Serial.println("CP2");
-        } else if (command.startsWith("TOOL[PEN_HOLDER],")) {
+        } else if (command.startsWith("TOOL[PEN]")) {  // pen holder does not need IO
             currentEOAT.type = 1;
-            currentEOAT.pin_count = 0;
-            currentEOAT.state = false;
-            
-            Serial.println("CP2");
-        } else if (command.startsWith("TOOL[VACUUM_PUMP],")) {
-            currentEOAT.type = 2;
             currentEOAT.pin_count = 0;
             currentEOAT.state = 0;
             
-            // 解析逗号分隔的多个IO指令
-            int startIndex = command.indexOf(',') + 1;
+            Serial.println("CP2");
+        } else if (command.startsWith("TOOL[PUMP]")) {
+            currentEOAT.type = 2;
+            currentEOAT.pin_count = 0;
+            currentEOAT.state = 0;
+
+            int startIndex = command.indexOf(',') + 1;  // skip TOOL[PUMP],
             while (startIndex < command.length()) {
                 int endIndex = command.indexOf(',', startIndex);
                 if (endIndex == -1) endIndex = command.length();
@@ -562,112 +661,150 @@ void loop() {
                 String io_str = command.substring(startIndex, endIndex);
                 if(io_str.startsWith("IO")) {
                     int pin = io_str.substring(2).toInt();
-                    currentEOAT.pins[currentEOAT.pin_count++] = pin;
+                    currentEOAT.pins[currentEOAT.pin_count++] = pin;  // use actual GPIO pin number
                 }
                 
                 startIndex = endIndex + 1;
             }
             
             Serial.println("CP2");
+        } else if (command.startsWith("M280")) {
+            // format: M280,<value> to control tool state
+            int firstComma = command.indexOf(',');
+            if (firstComma != -1) {
+                float value = command.substring(firstComma + 1).toFloat();
+                
+                if (currentEOAT.type == 0) { // gripper mode
+                    // 对于步进版本，直接使用角度值
+                    targetToolState = (int)value;
+                } else if (currentEOAT.type == 2) { // pump mode
+                    targetToolState = (int)value;
+                } else {
+                    targetToolState = (int)value;
+                }
+                
+                isMoveTool = true;
+            }
         } else if (command == "EXEC" && !potentiometersEnabled) {
             String cmd = Serial.readStringUntil('\n');
             // 处理逗号分隔的角度值
             int startIndex = 0;
+            bool parseSuccess = true;
+            
             for (int i = 0; i < numJoints; i++) {
                 int nextIndex = cmd.indexOf(',', startIndex);
                 if (nextIndex == -1 && i < numJoints - 1) {
-                    return; // 数据格式不正确
+                    parseSuccess = false;
+                    break; // Improper formatting of incoming data
                 }
                 String inputStr = (nextIndex == -1) ? cmd.substring(startIndex) : cmd.substring(startIndex, nextIndex);
-
-                targetAngles[i] = inputStr.toFloat();
-                startIndex = nextIndex + 1;
-            }
-            isExecute = true;
-        } else if (command == "MOVEONCE" && !potentiometersEnabled) {
-            String cmd = Serial.readStringUntil('\n');
-            // 处理MOVE_ONCE命令
-            int startIndex = 0;
-            for (int i = 0; i < numJoints; i++) {
-                int nextIndex = cmd.indexOf(',', startIndex);
-                if (nextIndex == -1 && i < numJoints - 1) {
-                    return; // 数据格式不正确
-                }
-                String inputStr = (nextIndex == -1) ? cmd.substring(startIndex) : cmd.substring(startIndex, nextIndex);
-                
-                targetAngles[i] = inputStr.toFloat();
+                tmpAngles[i] = inputStr.toFloat();
                 startIndex = nextIndex + 1;
             }
             
-            isMovingOnce = true;
-            isRecordingOnce = false;
-        } else if (command == "RECONCE" && !potentiometersEnabled) {
-            String cmd = Serial.readStringUntil('\n');
-            time_delay = cmd.toInt();
-            isRecordingOnce = true;
-            isMovingOnce = false;
-            isDelayed = false;  // 重置延迟标志
+            if (parseSuccess) {
+                // Try to add command to queue
+                if (enqueueCommand(tmpAngles)) {
+                    // Successfully added to queue, send immediate confirmation
+                    Serial.println("CP0");
+                    
+                    // If not currently executing, start execution with the first queued command
+                    if (!isExecute && queueCount > 0) {
+                        if (dequeueCommand(targetAngles)) {
+                            globalMotion.globalDuration = calculateGlobalMotionDuration(targetAngles, currentAngles);
+                            globalMotion.isNewMotion = true;
+                            isExecute = true;
+                        }
+                    }
+                } else {
+                    // Queue is full, send error
+                    Serial.println("QFULL");
+                }
+            }
+        } else if (command == "RECONCEJ") {
+            isRecordingOnceJoints = true;
+        } else if (command == "RECONCET") {
+            isRecordingOnceTool = true;
         } else if (command.startsWith("SPD,")) {
-            // 格式: SPD,speed1,speed2,speed3,speed4,speed5,speed6
-            int startIndex = command.indexOf(',') + 1;
-            for (int i = 0; i < numJoints; i++) {
-                int nextIndex = command.indexOf(',', startIndex);
-                if (nextIndex == -1 && i < numJoints - 1) {
-                    break; // 不完整数据也接受部分设置
-                }
-                String speedStr = (nextIndex == -1) ? command.substring(startIndex) : command.substring(startIndex, nextIndex);
-                int speed = speedStr.toInt();
-                if (speed > 0) {
-                    motorMaxSpeeds[i] = speed;
-                    // 立即更新电机速度
-                    if (i < numSteppers) {
-                        stepperArray[i]->setMaxSpeed(motorMaxSpeeds[i]);
+            // format: SPD,J1:0.2,J2:0.3,J4:0.1 to set speed factors for specific joints
+            String paramStr = command.substring(4); // skip "SPD," prefix
+            
+            // parse comma-separated joint speed settings
+            int startIndex = 0;
+            while (startIndex < paramStr.length()) {
+                int endIndex = paramStr.indexOf(',', startIndex);
+                if (endIndex == -1) endIndex = paramStr.length();
+                
+                String jointSpeedStr = paramStr.substring(startIndex, endIndex);
+                jointSpeedStr.trim(); // remove spaces
+                
+                // parse format like "J1:0.2"
+                int colonIndex = jointSpeedStr.indexOf(':');
+                if (colonIndex != -1) {
+                    String jointStr = jointSpeedStr.substring(0, colonIndex);
+                    String speedStr = jointSpeedStr.substring(colonIndex + 1);
+                    
+                    // extract joint number (J1 -> 0, J2 -> 1, etc.)
+                    if (jointStr.startsWith("J") && jointStr.length() > 1) {
+                        int jointId = jointStr.substring(1).toInt() - 1; // J1=0, J2=1, etc.
+                        float speed = speedStr.toFloat();
+                        
+                        // verify joint ID and speed value
+                        if (jointId >= 0 && jointId < numJoints && speed > 0.0f) {
+                            jointSpeedFactors[jointId] = speed;
+                        }
                     }
                 }
-                if (nextIndex == -1) break;
-                startIndex = nextIndex + 1;
+                
+                startIndex = endIndex + 1;
             }
-            Serial.println("SPD_SET");
-        } else if (command.startsWith("ACC,")) {
-            // 格式: ACC,accel1,accel2,accel3,accel4,accel5,accel6
-            int startIndex = command.indexOf(',') + 1;
-            for (int i = 0; i < numJoints; i++) {
-                int nextIndex = command.indexOf(',', startIndex);
-                if (nextIndex == -1 && i < numJoints - 1) {
-                    break; // 不完整数据也接受部分设置
+        } else if (command.startsWith("GPULSE,")) {
+            // format: GPULSE,J1 to get the current steps value of joint 1
+            String jointStr = command.substring(7); // skip "GPULSE," prefix
+            if (jointStr.startsWith("J") && jointStr.length() > 1) {
+                int jointId = jointStr.substring(1).toInt() - 1; // J1=0, J2=1, etc.
+                if (jointId >= 0 && jointId < numSteppers) {
+                    long steps = stepperArray[jointId]->currentPosition();
+                    // send a single command response
+                    Serial.println("PULSE,J" + String(jointId + 1) + "," + String(steps));
                 }
-                String accelStr = (nextIndex == -1) ? command.substring(startIndex) : command.substring(startIndex, nextIndex);
-                int accel = accelStr.toInt();
-                if (accel > 0) {
-                    motorAccelerations[i] = accel;
-                    // 立即更新电机加速度
-                    if (i < numSteppers) {
-                        stepperArray[i]->setAcceleration(motorAccelerations[i]);
-                    }
-                }
-                if (nextIndex == -1) break;
-                startIndex = nextIndex + 1;
             }
-            Serial.println("ACC_SET");
         }
     }
     
     if (mode == 0) { // 控制器模式
         bool allSteppersDone = true;
+        bool isMoveToolDone = false;
         
         if (!isReplaying) {
-            // 控制步进电机运动
-            if (isMovingOnce) {
-                for (int i = 0; i < numJoints; i++) {
-                    tmpAngles[i] = moveMotor(targetAngles[i], tmpAngles[i], i, false);
-                }
-            } else {
-                for (int i = 0; i < numJoints; i++) {
-                    if (!isRecordingOnce && !isMovingOnce) {
-                        currentAngles[i] = moveMotor(targetAngles[i], currentAngles[i], i, false);
-                    } else {
-                        currentAngles[i] = moveMotor(targetAngles[i], currentAngles[i], i, true);
+            // 执行关节运动
+            if (isExecute) {
+                if (isRecording) {
+                    // during recording, use tmpAngles
+                    for (int i = 0; i < numJoints; i++) {
+                        tmpAngles[i] = moveMotor(targetAngles[i], tmpAngles[i], i, false);
                     }
+                } else {
+                    // normal execution mode
+                    for (int i = 0; i < numJoints; i++) {
+                        currentAngles[i] = moveMotor(targetAngles[i], currentAngles[i], i, false);
+                    }
+                }
+            } else if (isMoveTool) {
+                if (currentEOAT.type == 0) {
+                    currentEOAT.state = controlGripper(targetToolState);
+                } else if (currentEOAT.type == 2) {
+                    currentEOAT.state = controlPump(targetToolState);
+                }
+            } else if (isRecordingOnceJoints) {
+                for (int i = 0; i < numJoints; i++) {
+                    currentAngles[i] = moveMotor(targetAngles[i], currentAngles[i], i, true);
+                }
+            } else if (isRecordingOnceTool) {
+                if (currentEOAT.type == 0) {
+                    currentEOAT.state = controlGripper(targetToolState);
+                } else if (currentEOAT.type == 2) {
+                    currentEOAT.state = controlPump(targetToolState);
                 }
             }
             
@@ -687,38 +824,7 @@ void loop() {
         } else if (isReplaying) {
             // 回放模式
             if (!isPaused) {
-                int angles[numJoints];
-                int startIndex = 0;
-                
-                // 需要从Serial读取命令
-                String replayCommand = Serial.readStringUntil('\n');
-                
-                // 解析命令字符串中的角度值
-                for (int i = 0; i < numJoints; i++) {
-                    int nextIndex = replayCommand.indexOf(',', startIndex);
-                    if (nextIndex == -1 && i < numJoints - 1) {
-                        return; // 数据格式不正确
-                    }
-                    String angleStr = (nextIndex == -1) ? replayCommand.substring(startIndex) : replayCommand.substring(startIndex, nextIndex);
-                    angles[i] = angleStr.toInt();
-                    startIndex = nextIndex + 1;
-                    
-                    if (i == 4) {
-                        if (currentEOAT.type == 0) {
-                            controlGripper(angles[i]);
-                        } else if (currentEOAT.type == 2) {
-                            controlPump(angles[i]);
-                        }
-                    } else if (i < numSteppers) {
-                        
-                        // 设置电机目标位置
-                        long steps = degreesToSteps(angles[i], i);
-                        stepperArray[i]->moveTo(steps);
-                        updateStepperActivity(i);
-                    }
-                }
-                
-                // 同步运行所有电机
+                // 运行步进电机
                 for (int i = 0; i < numSteppers; i++) {
                     if (stepperEnabled[i]) {
                         bool running = stepperArray[i]->run();
@@ -739,14 +845,34 @@ void loop() {
             }
         }
         
-        if (allSteppersDone && isExecute) {
-            Serial.println("CP0");
-            isExecute = false;
+        // check if tool has reached target state
+        if (currentEOAT.state == targetToolState) {
+            isMoveToolDone = true;
+            if (isMoveTool) {
+                Serial.println("TP0");
+                isMoveTool = false;
+            }
         }
         
+        // Check if current motion is complete and handle queue
+        if (allSteppersDone && isExecute) {
+            // Try to load next command from queue
+            if (dequeueCommand(targetAngles)) {
+                // Successfully loaded next command from queue
+                // Calculate new motion parameters
+                globalMotion.globalDuration = calculateGlobalMotionDuration(targetAngles, currentAngles);
+                globalMotion.isNewMotion = true;
+                // Continue executing (don't set isExecute to false)
+            } else {
+                // Queue is empty, stop executing
+                isExecute = false;
+            }
+        }
+        
+        // recording callbacks
         if (isRecording) {
-            if (!allSteppersDone && isRecordingOnce) {
-                Serial.print("REC,");
+            if (!allSteppersDone && isRecordingOnceJoints) {
+                Serial.print("REC,");  // add REC verification
                 for (int i = 0; i < numJoints; i++) {
                     Serial.print(currentAngles[i]);
                     if (i < numJoints - 1) {
@@ -755,16 +881,21 @@ void loop() {
                         Serial.println();
                     }
                 }
-            } else if (allSteppersDone && isRecordingOnce && !isDelayed) {
-                // 只发送一次延迟命令
-                Serial.print("REC,D");
-                Serial.println(time_delay);
-                isDelayed = true;
+            } else if (allSteppersDone && isRecordingOnceJoints) {
+                Serial.println("CP0");
+                isRecordingOnceJoints = false;
+            }
+            
+            if (isMoveToolDone && isRecordingOnceTool) {
+                Serial.print("M280,");
+                Serial.println(currentEOAT.state);
+                Serial.println("TP0");
+                isRecordingOnceTool = false;
             }
         }
+        
+        delay(5);
     } else if (mode == 1) {
         // ROS模式，暂不实现
     }
-    
-    delay(5);
 }

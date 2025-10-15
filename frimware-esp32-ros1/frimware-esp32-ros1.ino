@@ -1,19 +1,3 @@
-/*
- * Copyright 2025 Noman Robotics
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include "Wire.h"
 #include <Adafruit_PWMServoDriver.h>
 #include <Preferences.h>
@@ -96,9 +80,20 @@ short rosAngles[numServos];
 int time_delay = 0;
 int time_elapse = 0;
 
+// Command queue for buffering multiple EXEC commands
+#define CMD_QUEUE_SIZE 45
+struct CommandBuffer {
+    float angles[numServos];
+    bool valid;
+};
+CommandBuffer commandQueue[CMD_QUEUE_SIZE];
+int queueHead = 0;  // where to read from
+int queueTail = 0;  // where to write to
+int queueCount = 0; // number of commands in queue
+
 // speed factors for each motor
 float jointSpeedFactors[numServos] = {1.0f, 1.0f, 1.0f, 1.0f};
-const unsigned long BASE_MOTION_DURATION = 1500;
+const unsigned long BASE_MOTION_DURATION = 900;
 
 // motion state of joint
 struct MotionState {
@@ -155,6 +150,51 @@ ros::Subscriber<sensor_msgs::JointState> sub("joint_states", servo_cb);
 #endif
 
 /* ------------------------------------------------------------------------------ Helper Functions */
+
+// Queue helper functions
+bool isQueueFull() {
+    return queueCount >= CMD_QUEUE_SIZE;
+}
+
+bool isQueueEmpty() {
+    return queueCount == 0;
+}
+
+bool enqueueCommand(float angles[]) {
+    if (isQueueFull()) {
+        return false;
+    }
+    
+    // copy angles to queue
+    for (int i = 0; i < numServos; i++) {
+        commandQueue[queueTail].angles[i] = angles[i];
+    }
+    commandQueue[queueTail].valid = true;
+    
+    // move tail pointer
+    queueTail = (queueTail + 1) % CMD_QUEUE_SIZE;
+    queueCount++;
+    
+    return true;
+}
+
+bool dequeueCommand(float angles[]) {
+    if (isQueueEmpty()) {
+        return false;
+    }
+    
+    // copy angles from queue
+    for (int i = 0; i < numServos; i++) {
+        angles[i] = commandQueue[queueHead].angles[i];
+    }
+    commandQueue[queueHead].valid = false;
+    
+    // move head pointer
+    queueHead = (queueHead + 1) % CMD_QUEUE_SIZE;
+    queueCount--;
+    
+    return true;
+}
 
 bool arePotentiometersConnected() {
   int potVals[numServos];
@@ -221,16 +261,6 @@ float smoothInterpolation(float start, float target, float progress) {
     while (angleDiff < -180) angleDiff += 360;
     
     return start + angleDiff * smoothProgress;
-}
-
-unsigned long calculateMotionDuration(float angleChange, int jointId) {
-    float absChange = abs(angleChange);
-    // calculate the basic time based on the angle change, then apply the speed factor of the joint
-    unsigned long duration = (unsigned long)(BASE_MOTION_DURATION * (absChange / 90.0f));
-    if (jointId >= 0 && jointId < numServos) {
-        return (unsigned long)(duration / jointSpeedFactors[jointId]);
-    }
-    return duration;
 }
 
 // calculate the maximum motion time of all active joints
@@ -499,6 +529,14 @@ void setup() {
   globalMotion.activeJoints = 0;
   globalMotion.syncMode = true;
 
+  // initialize command queue
+  queueHead = 0;
+  queueTail = 0;
+  queueCount = 0;
+  for (int i = 0; i < CMD_QUEUE_SIZE; i++) {
+    commandQueue[i].valid = false;
+  }
+
   #if ENABLE_ROS
   str_msg2.data_length = numServos+1;
   str_msg2.data = (int16_t *)malloc(sizeof(int16_t) * (numServos+1));
@@ -671,22 +709,38 @@ void loop() {
       String command = Serial.readStringUntil('\n');
       // Process the incoming command as comma-separated PWM values
       int startIndex = 0;
+      bool parseSuccess = true;
+      
       for (int i = 0; i < numServos; i++) {
         int nextIndex = command.indexOf(',', startIndex);
         if (nextIndex == -1 && i < numServos - 1) {
-            return; // Improper formatting of incoming data
+            parseSuccess = false;
+            break; // Improper formatting of incoming data
         }
         String inputStr = (nextIndex == -1) ? command.substring(startIndex) : command.substring(startIndex, nextIndex);
-
-        targetAngles[i] = inputStr.toFloat();
+        tmpAngles[i] = inputStr.toFloat();
         startIndex = nextIndex + 1;
       }
       
-      // calculate global motion parameters
-      globalMotion.globalDuration = calculateGlobalMotionDuration(targetAngles, currentAngles);
-      globalMotion.isNewMotion = true;
-      
-      isExecute = true;
+      if (parseSuccess) {
+        // Try to add command to queue
+        if (enqueueCommand(tmpAngles)) {
+          // Successfully added to queue, send immediate confirmation
+          Serial.println("CP0");
+          
+          // If not currently executing, start execution with the first queued command
+          if (!isExecute && queueCount > 0) {
+            if (dequeueCommand(targetAngles)) {
+              globalMotion.globalDuration = calculateGlobalMotionDuration(targetAngles, currentAngles);
+              globalMotion.isNewMotion = true;
+              isExecute = true;
+            }
+          }
+        } else {
+          // Queue is full, send error
+          Serial.println("QFULL");
+        }
+      }
 
     } else if (command == "RECONCEJ") {
       isRecordingOnceJoints = true;
@@ -856,10 +910,17 @@ void loop() {
         }
       }
 
-      // callbacks
-      if (allServosDone) {
-        if (isExecute) {
-          Serial.println("CP0");
+      // Check if current motion is complete and handle queue
+      if (allServosDone && isExecute) {
+        // Try to load next command from queue
+        if (dequeueCommand(targetAngles)) {
+          // Successfully loaded next command from queue
+          // Calculate new motion parameters
+          globalMotion.globalDuration = calculateGlobalMotionDuration(targetAngles, currentAngles);
+          globalMotion.isNewMotion = true;
+          // Continue executing (don't set isExecute to false)
+        } else {
+          // Queue is empty, stop executing
           isExecute = false;
         }
       }

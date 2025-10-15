@@ -1,42 +1,15 @@
+#include <Arduino.h>
 #include "Wire.h"
 #include <Adafruit_PWMServoDriver.h>
-#include <Preferences.h>
+#include <EEPROM.h>
 
 // macro to enable ROS
 #define ENABLE_ROS 0
 
 #if ENABLE_ROS
-#include <micro_ros_arduino.h>
-#include <stdio.h>
-#include <rcl/rcl.h>
-#include <rcl/error_handling.h>
-#include <rclc/rclc.h>
-#include <rclc/executor.h>
-#include <sensor_msgs/msg/joint_state.h>
-
-// 为消息数据预分配静态内存
-static double pub_position_data[6];
-static double pub_velocity_data[6];
-static double pub_effort_data[6];
-
-rcl_publisher_t publisher;
-rcl_subscription_t subscriber;
-sensor_msgs__msg__JointState pub_msg;
-sensor_msgs__msg__JointState msg;
-rclc_executor_t executor;
-rcl_allocator_t allocator;
-rclc_support_t support;
-rcl_node_t node;
-
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
-
-// Error handle loop
-void error_loop() {
-  while(1) {
-    delay(100);
-  }
-}
+#include <ros.h>
+#include <std_msgs/Int16MultiArray.h>
+#include <sensor_msgs/JointState.h>
 #endif
 
 #define MIN_PULSE_WIDTH       700
@@ -46,14 +19,18 @@ void error_loop() {
 #define VACUUM_ON       600   // pump on pulse
 
 // version check
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.0-Arduino"
+
+// EEPROM settings
+#define EEPROM_SIZE 512
+#define EEPROM_START_ADDRESS 0
+#define EEPROM_MAGIC_NUMBER 0xAB  // Magic number to verify EEPROM is initialized
 
 /* ---------------------------------------------------------------------------------------- Init */
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
-Preferences preferences;
 
 const int numServos = 4; // number of robot arm joints, excluding end effector
-const int potPins[5] = {25, 26, 27, 14, 13}; // pin numbers for potentiometers (include end effector potentiometer)
+const int potPins[5] = {A0, A1, A2, A3, A4}; // pin numbers for potentiometers (include end effector potentiometer)
 const int mtrPins[numServos] = {15, 14, 13, 12}; // pin numbers for servos (pca9685) (only 4 joints)
 const int gripperPin = 11; // pin number for gripper servo (pca9685)
 const int homePositions[numServos] = {0, 0, 360, 0};
@@ -65,15 +42,6 @@ const float jointLimits[numServos][2] = {
 };
 const float gear_ratio4 = 24.0f / 19.0f; // Gear ratio for joint 4 (motor teeth / output teeth = 24 / 19)
 
-const char* joint_names[] = {
-    "Revolute1",
-    "Revolute2",
-    "Revolute3",
-    "Revolute4",
-    "Slider5",
-    "Slider6"
-};
-
 struct EOAT_Type {
     uint8_t type;          // 0: GRIPPER, 1: PEN_HOLDER, 2: VACUUM_PUMP
     uint8_t pins[4];       // multiple IO pins that the tool may use
@@ -82,8 +50,8 @@ struct EOAT_Type {
 };
 EOAT_Type currentEOAT;
 
-// calibration offsets for motors
-float calibrationOffsets[numServos][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}}; // Joint offsets
+// calibration offset for pulse max and min
+float calibrationOffsets[numServos][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
 float gripperOffset[2] = {370.0f, -390.0f}; // Gripper offset
 
 const int potRange = 2705; // potentiometer range
@@ -112,13 +80,13 @@ int targetToolState = 0;
 float targetAngles[numServos];
 float currentAngles[numServos];  
 float tmpAngles[numServos];
-float rosAngles[numServos];
+short rosAngles[numServos];
 
 int time_delay = 0;
 int time_elapse = 0;
 
 // Command queue for buffering multiple EXEC commands
-#define CMD_QUEUE_SIZE 45
+#define CMD_QUEUE_SIZE 30
 struct CommandBuffer {
     float angles[numServos];
     bool valid;
@@ -156,168 +124,34 @@ const float MIN_STEP = 1.5f;     // minimum step degree
 int mode = 0; // 0 for Controller mode, 1 for ROS mode
 
 #if ENABLE_ROS
-// temporary data buffer
-static struct {
-    char name_buffer[6][16];  // fixed size buffer for 6 joint names
-    double positions[6];      // fixed size buffer for position data
-    size_t count;            // actual number of received joints
-} joint_data_buffer;
+ros::NodeHandle nh;
+std_msgs::Int16MultiArray str_msg2;
+ros::Publisher chatter("servoarm", &str_msg2);
 
-// simple hash function
-inline uint8_t joint_name_to_index(const char* name) {
-    // only the last character, convert to index (1-6 -> 0-5)
-    return name[strlen(name) - 1] - '1';
-}
-
-void publishJointStates() {
-    // update joint names
-    for(int i = 0; i < 6; i++) {
-        // use safe string copy method
-        size_t len = strlen(joint_names[i]);
-        memcpy(pub_msg.name.data[i].data, joint_names[i], len + 1);
-        pub_msg.name.data[i].size = len;
-    }
-    pub_msg.name.size = 6;
-
-    // update joint positions
-    for(int i = 0; i < numServos; i++) {
-        pub_position_data[i] = rosAngles[i] * (PI / 180.0);
-    }
-    pub_position_data[4] = currentEOAT.state;
-    pub_position_data[5] = currentEOAT.state;
-    
-    memcpy(pub_msg.position.data, pub_position_data, sizeof(double) * 6);
-    pub_msg.position.size = 6;
-    
-    RCSOFTCHECK(rcl_publish(&publisher, &pub_msg, NULL));
-}
-
-void subscription_callback(const void * msgin)
+void servo_cb(const sensor_msgs::JointState& cmd_msg)
 {
-    const sensor_msgs__msg__JointState * msg = (const sensor_msgs__msg__JointState *)msgin;
-    
-    // empty the count
-    joint_data_buffer.count = 0;
-    int tool_state = 0;
-    
-    // safe copy data to buffer
-    for(size_t i = 0; i < msg->name.size && i < 6; i++) {
-        // safe copy joint name
-        if (msg->name.data[i].size < 16) {
-            memcpy(joint_data_buffer.name_buffer[i], 
-                   msg->name.data[i].data,
-                   msg->name.data[i].size);
-            joint_data_buffer.name_buffer[i][msg->name.data[i].size] = '\0';
-            
-            // copy position data
-            joint_data_buffer.positions[i] = msg->position.data[i];
-            joint_data_buffer.count++;
-        }
-    }
-    
-    // update joint angles using buffer data
-    for(size_t i = 0; i < joint_data_buffer.count; i++) {
-        uint8_t joint_idx = joint_name_to_index(joint_data_buffer.name_buffer[i]);
-        
-        if (joint_idx < 4) {  // 1-4号关节
-            rosAngles[joint_idx] = joint_data_buffer.positions[i] * 57.2958f;
-        } else if (joint_idx == 4 && currentEOAT.type == 0) {  // 5号关节
-            tool_state = gripperDistanceToAngle(joint_data_buffer.positions[i]);
-        }
-    }
+  // 直接将弧度转换为角度
+  double angles[numServos+1];  // +1 for gripper
+  angles[0] = radiansToDegrees(cmd_msg.position[0]);
+  angles[1] = radiansToDegrees(cmd_msg.position[1]); 
+  angles[2] = radiansToDegrees(cmd_msg.position[2]);
+  angles[3] = radiansToDegrees(cmd_msg.position[3]);
+  // 将夹爪距离(米)映射到角度(90-180度)
+  angles[4] = gripperDistanceToAngle(cmd_msg.position[4]);
 
-    // batch update joint positions
-    for(int i = 0; i < numServos; i++) {
-        setServoPosition(mtrPins[i], rosAngles[i], jointLimits[i][0], jointLimits[i][1], calibrationOffsets[i][0], calibrationOffsets[i][1]);
-    }
-    currentEOAT.state = controlGripper(tool_state, false);
-}
-
-// add initialization and closing functions
-void init_joint_state_msg(sensor_msgs__msg__JointState* msg){
-  // allocate memory for name array
-  msg->name.capacity = 6;
-  msg->name.size = 0;
-  msg->name.data = (rosidl_runtime_c__String*)malloc(msg->name.capacity * sizeof(rosidl_runtime_c__String));
-  
-  // allocate memory for each string
-  for(size_t i = 0; i < msg->name.capacity; i++) {
-    msg->name.data[i].data = (char*)malloc(16);
-    msg->name.data[i].capacity = 16;
-    msg->name.data[i].size = 0;
+  // 存储角度用于发布回ROS
+  for(int i = 0; i < numServos; i++) {
+    rosAngles[i] = (short)angles[i];
+    setServoPosition(mtrPins[i], angles[i], jointLimits[i][0], jointLimits[i][1], calibrationOffsets[i][0], calibrationOffsets[i][1]);
   }
-
-  // allocate memory for other arrays
-  msg->position.capacity = 6;
-  msg->position.size = 0;
-  msg->position.data = (double*)malloc(msg->position.capacity * sizeof(double));
-
-  msg->velocity.capacity = 6;
-  msg->velocity.size = 0;
-  msg->velocity.data = (double*)malloc(msg->velocity.capacity * sizeof(double));
-
-  msg->effort.capacity = 6;
-  msg->effort.size = 0;
-  msg->effort.data = (double*)malloc(msg->effort.capacity * sizeof(double));
-}
-
-void initMicroROS() {
-  set_microros_transports();
   
-  delay(2000);
-
-  allocator = rcl_get_default_allocator();
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-  RCCHECK(rclc_node_init_default(&node, "esp32_servo_node", "", &support));
-
-  RCCHECK(rclc_publisher_init_default(
-    &publisher,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
-    "joint_states_feedback"));
-
-  RCCHECK(rclc_subscription_init_default(
-    &subscriber,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
-    "joint_states"));
-
-  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg, 
-    &subscription_callback, ON_NEW_DATA));
-  
-  init_joint_state_msg(&msg);
-  init_joint_state_msg(&pub_msg);
-}
-
-void destroyMicroROS() {
-  // clean up each string in the name array
-  for(size_t i = 0; i < pub_msg.name.capacity; i++) {
-    free(pub_msg.name.data[i].data);
+  // 处理夹爪
+  if(currentEOAT.type == 0) {
+    currentEOAT.state = controlGripper(angles[4], false);
   }
-  free(pub_msg.name.data);
-  
-  // clean up msg memory
-  for(size_t i = 0; i < msg.name.capacity; i++) {
-    free(msg.name.data[i].data);
-  }
-  free(msg.name.data);
-  
-  // clean up other arrays
-  free(pub_msg.position.data);
-  free(pub_msg.velocity.data);
-  free(pub_msg.effort.data);
-  free(msg.position.data);
-  free(msg.velocity.data);
-  free(msg.effort.data);
-  
-  // close ROS resources
-  rcl_publisher_fini(&publisher, &node);
-  rcl_subscription_fini(&subscriber, &node);
-  rcl_node_fini(&node);
-  rclc_executor_fini(&executor);
-  rclc_support_fini(&support);
 }
+
+ros::Subscriber<sensor_msgs::JointState> sub("joint_states", servo_cb);
 #endif
 
 /* ------------------------------------------------------------------------------ Helper Functions */
@@ -379,6 +213,13 @@ bool arePotentiometersConnected() {
          (potVals[2] > 300 && potVals[2] < 540) && 
          (potVals[1] > 3100 && potVals[1] < 3300) && 
          (potVals[0] > 1700 && potVals[0] < 2100);
+}
+
+// Convert radians to degreees
+double radiansToDegrees(float position_radians)
+{
+  position_radians = position_radians * 57.2958;
+  return position_radians;
 }
 
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
@@ -506,10 +347,10 @@ int moveMotorPot(int pinNum) {
 
   // apply filter
   switch (potPins[pinNum]) {
-    case 14: EMA_W = (EMA_a * potVal) + ((1 - EMA_a) * EMA_W); potVal = EMA_W; break;
-    case 27: EMA_E = (EMA_a * potVal) + ((1 - EMA_a) * EMA_E); potVal = EMA_E; break;
-    case 26: EMA_S = (EMA_a * potVal) + ((1 - EMA_a) * EMA_S); potVal = EMA_S; break;
-    case 25: EMA_B = (EMA_a * potVal) + ((1 - EMA_a) * EMA_B); potVal = EMA_B; break;
+    case A3: EMA_W = (EMA_a * potVal) + ((1 - EMA_a) * EMA_W); potVal = EMA_W; break;
+    case A2: EMA_E = (EMA_a * potVal) + ((1 - EMA_a) * EMA_E); potVal = EMA_E; break;
+    case A1: EMA_S = (EMA_a * potVal) + ((1 - EMA_a) * EMA_S); potVal = EMA_S; break;
+    case A0: EMA_B = (EMA_a * potVal) + ((1 - EMA_a) * EMA_B); potVal = EMA_B; break;
   }
 
   // map the potentiometer position to the motor with calibration offsets applied
@@ -577,29 +418,50 @@ int controlPump(int state, bool fake) {
     return state;
 }
 
-// save calibration offsets
-void saveCalibrationOffsets() {
-  preferences.begin("robot-arm", false); // open namespace
-  for (int i = 0; i < numServos; i++) {
-    char keyMin[16], keyMax[16];
-    sprintf(keyMin, "offset_%d_min", i);
-    sprintf(keyMax, "offset_%d_max", i);
-    preferences.putFloat(keyMin, calibrationOffsets[i][0]);
-    preferences.putFloat(keyMax, calibrationOffsets[i][1]);
+// EEPROM helper functions for Arduino
+void initEEPROM() {
+  // Check if EEPROM is initialized
+  byte magic = EEPROM.read(EEPROM_START_ADDRESS);
+  if (magic != EEPROM_MAGIC_NUMBER) {
+    // EEPROM not initialized, write default values
+    EEPROM.write(EEPROM_START_ADDRESS, EEPROM_MAGIC_NUMBER);
+    
+    // Write default calibration offsets (all zeros)
+    int addr = EEPROM_START_ADDRESS + 1;
+    for (int i = 0; i < numServos; i++) {
+      // Write minOffset (4 bytes for float)
+      EEPROM.put(addr, 0.0f);
+      addr += sizeof(float);
+      // Write maxOffset (4 bytes for float)
+      EEPROM.put(addr, 0.0f);
+      addr += sizeof(float);
+    }
   }
-  preferences.end();
+}
+
+// save calibration offsets to EEPROM
+void saveCalibrationOffsets() {
+  int addr = EEPROM_START_ADDRESS + 1; // Skip magic number
+  for (int i = 0; i < numServos; i++) {
+    // Write minOffset
+    EEPROM.put(addr, calibrationOffsets[i][0]);
+    addr += sizeof(float);
+    // Write maxOffset
+    EEPROM.put(addr, calibrationOffsets[i][1]);
+    addr += sizeof(float);
+  }
 }
 
 void loadCalibrationOffsets() {
-  preferences.begin("robot-arm", true); // open in read-only mode
+  int addr = EEPROM_START_ADDRESS + 1; // Skip magic number
   for (int i = 0; i < numServos; i++) {
-    char keyMin[16], keyMax[16];
-    sprintf(keyMin, "offset_%d_min", i);
-    sprintf(keyMax, "offset_%d_max", i);
-    calibrationOffsets[i][0] = preferences.getFloat(keyMin, 0.0f); // default value is 0
-    calibrationOffsets[i][1] = preferences.getFloat(keyMax, 0.0f); // default value is 0
+    // Read minOffset
+    EEPROM.get(addr, calibrationOffsets[i][0]);
+    addr += sizeof(float);
+    // Read maxOffset
+    EEPROM.get(addr, calibrationOffsets[i][1]);
+    addr += sizeof(float);
   }
-  preferences.end();
 }
 
 // set calibration offset
@@ -648,6 +510,9 @@ void setup() {
   
   Serial.begin(115200);
   
+  // Initialize EEPROM
+  initEEPROM();
+  
   // Setup PWM Controller object
   pwm.begin();
   pwm.setPWMFreq(FREQUENCY);
@@ -684,7 +549,7 @@ void setup() {
     jointStates[i].isMoving = false;
     setServoPosition(mtrPins[i], homePositions[i], jointLimits[i][0], jointLimits[i][1], calibrationOffsets[i][0], calibrationOffsets[i][1]);
   }
-
+  
   mode = 0; // Start in Controller mode
   
   // initialize global motion state
@@ -700,6 +565,11 @@ void setup() {
   for (int i = 0; i < CMD_QUEUE_SIZE; i++) {
     commandQueue[i].valid = false;
   }
+
+  #if ENABLE_ROS
+  str_msg2.data_length = numServos+1;
+  str_msg2.data[numServos] = (int16_t *)malloc(sizeof(int16_t) * (numServos+1));
+  #endif
 }
  
 void loop() {
@@ -707,15 +577,13 @@ void loop() {
   if (Serial.available()) {
     command = Serial.readStringUntil('\n');
     if (command == "VERC") {
-      String chipModel = ESP.getChipModel();
-      uint32_t freeHeap = ESP.getFreeHeap() / 1024.0;
-      uint32_t cpuFreq = ESP.getCpuFreqMHz();
+      // Arduino version info (simplified)
+      unsigned long freeRam = freeMemory();
       
       Serial.println("INFOS");
       Serial.println("VER," + String(FIRMWARE_VERSION));
-      Serial.println("Chip Model: " + chipModel);
-      Serial.println("Free Mem: " + String(freeHeap) + " KB");
-      Serial.println("CPU Freq: " + String(cpuFreq) + " MHz");
+      Serial.println("Board: Arduino Compatible");
+      Serial.println("Free Mem: " + String(freeRam) + " bytes");
       Serial.println("INFOE");
     } else if (command.startsWith("CALIBRATE,")) {
       // format: CALIBRATE,joint,minOffset,maxOffset
@@ -775,16 +643,18 @@ void loop() {
       potentiometersEnabled = true;
       Serial.println("POT1");
     } else if (command == "TOROS") {
-      #if ENABLE_ROS
-      delay(1000);
-      initMicroROS();
-      #endif
       mode = 1;
-    } else if (command == "TOCTR") {
+
       #if ENABLE_ROS
-      destroyMicroROS();
-      delay(1000);
+      // initialise ROS
+      nh.getHardware()->setBaud(115200);
+      nh.initNode();
+      delay(2000);
+      nh.subscribe(sub);
+      nh.advertise(chatter);
+      delay(2000);
       #endif
+    } else if (command == "TOCTR") {
       mode = 0;
     } else if (command.startsWith("TOOL[GRIPPER]")) {
       currentEOAT.type = 0;
@@ -963,48 +833,48 @@ void loop() {
         for (int i = 0; i < numServos; i++) {
           currentAngles[i] = moveMotorPot(i);
         }
-      }
 
-      // Handle end effector potentiometer separately (index 4)
-      int pushButton = digitalRead(potPins[4]);
-      int previousToolState = currentEOAT.state; // record previous state
-      
-      if (currentEOAT.type == 0) { // gripper
-        if (pushButton == LOW) {
-          currentEOAT.state = controlGripper(135, false);
-        } else {
-          currentEOAT.state = controlGripper(90, false);
-        }
-      } else if (currentEOAT.type == 2) { // vacuum pump
-        if (pushButton == LOW) {
-          currentEOAT.state = controlPump(1, false); // turn on suction
-        } else {
-          currentEOAT.state = controlPump(0, false); // turn off suction
-        }
-      }
-      
-      // check if tool state changed (for potentiometer mode recording)
-      bool toolStateChanged = (previousToolState != currentEOAT.state);
-
-      // recording callbacks
-      if (isRecording) {
-        Serial.print("REC,");  // add REC verification
-        for (int i = 0; i < numServos; i++) {
-          int angle = map(currentAngles[i], MIN_PULSE_WIDTH, MAX_PULSE_WIDTH, int(jointLimits[i][0]), int(jointLimits[i][1]));
-          Serial.print(angle);
-          if (i < numServos - 1) {
-            Serial.print(",");
+        // Handle end effector potentiometer separately (index 4)
+        int pushButton = digitalRead(potPins[4]);
+        int previousToolState = currentEOAT.state; // record previous state
+        
+        if (currentEOAT.type == 0) { // gripper
+          if (pushButton == LOW) {
+            currentEOAT.state = controlGripper(135, false);
           } else {
-            Serial.println();
+            currentEOAT.state = controlGripper(90, false);
+          }
+        } else if (currentEOAT.type == 2) { // vacuum pump
+          if (pushButton == LOW) {
+            currentEOAT.state = controlPump(1, false); // turn on suction
+          } else {
+            currentEOAT.state = controlPump(0, false); // turn off suction
           }
         }
+        
+        // check if tool state changed (for potentiometer mode recording)
+        bool toolStateChanged = (previousToolState != currentEOAT.state);
 
-        if (toolStateChanged) {
-          Serial.print("M280,");
-          if (currentEOAT.type == 0) { // gripper - convert back to distance
-            Serial.println(gripperAngleToDistance(currentEOAT.state));
-          } else {
-            Serial.println(currentEOAT.state);
+        // recording callbacks
+        if (isRecording) {
+          Serial.print("REC,");  // add REC verification
+          for (int i = 0; i < numServos; i++) {
+            int angle = map(currentAngles[i], MIN_PULSE_WIDTH, MAX_PULSE_WIDTH, int(jointLimits[i][0]), int(jointLimits[i][1]));
+            Serial.print(angle);
+            if (i < numServos - 1) {
+              Serial.print(",");
+            } else {
+              Serial.println();
+            }
+          }
+
+          if (toolStateChanged) {
+            Serial.print("M280,");
+            if (currentEOAT.type == 0) { // gripper - convert back to distance
+              Serial.println(gripperAngleToDistance(currentEOAT.state));
+            } else {
+              Serial.println(currentEOAT.state);
+            }
           }
         }
       }
@@ -1016,7 +886,7 @@ void loop() {
       if (isMicroStep) {                            // REP
         for (int i = 0; i < numServos; i++) {
           setServoPosition(mtrPins[i], targetAngles[i], jointLimits[i][0], jointLimits[i][1], calibrationOffsets[i][0], calibrationOffsets[i][1]);
-          currentAngles[i] = targetAngles[i]; // 更新当前角度
+          currentAngles[i] = targetAngles[i]; // update current angle
         }
         Serial.println("CP1");
         isMicroStep = false;
@@ -1114,12 +984,27 @@ void loop() {
       
       delay(5); // Adjust based on your needs
     }
+    
   } else if (mode == 1) {
     #if ENABLE_ROS
-    // ROS2 mode operation
-    RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10)));
-    publishJointStates();
+    // ROS mode operation
+    for(int i = 0; i < numServos; i++) {
+        str_msg2.data[i] = rosAngles[i];
+    }
+    str_msg2.data[numServos] = currentEOAT.state;
+    str_msg2.data_length = numServos+1;
+    delay(2);
+    chatter.publish(&str_msg2);
+    nh.spinOnce();
     #endif
   }
   
 }
+
+// Helper function to get free memory (for Arduino)
+int freeMemory() {
+  extern int __heap_start, *__brkval;
+  int v;
+  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
+}
+
