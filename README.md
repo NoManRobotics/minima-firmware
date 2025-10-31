@@ -17,7 +17,7 @@ This is the repository for releasing firmware code for robot arm MINIMA
 
 ## Install (must read!)
 
-**First-time upload** must use one of the following two ways:
+**<u>First-time upload</u>** must use one of the following two ways:
 1. Arduino IDE with the .ino file
 2. esptool with bootloader, partition and the app
 
@@ -26,7 +26,9 @@ If you use esptool(either python or online web), you must upload to correct addr
 - .ino.partitions ----> address 0x8000
 - .ino            ----> address 0x10000
 
-**Updating firmware** can be done through:
+and you need to press reset button after upload.
+
+**<u>Updating firmware</u>** can be done through:
 
 - noman-app remote firmare update
 - Arduino IDE
