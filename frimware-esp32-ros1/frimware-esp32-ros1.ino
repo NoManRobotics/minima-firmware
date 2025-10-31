@@ -18,7 +18,7 @@
 #define VACUUM_ON       600   // pump on pulse
 
 // version check
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.1.1"
 
 /* ---------------------------------------------------------------------------------------- Init */
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
